@@ -1,0 +1,3 @@
+#!/bin/bash
+
+export PATH="##SHARED_DIR##/bin:##SHARED_DIR##/scripts:##SHARED_DIR##/tools:$PATH"

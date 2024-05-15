@@ -1,0 +1,289 @@
+#!/usr/bin/python3 -B
+
+# PYTHON_ARGCOMPLETE_OK
+
+shared_dir = '##SHARED_DIR##'
+container_image = '##IMAGE##'
+container_image_tag = '##IMAGE_TAG##'
+
+import sys
+python_version = f'{sys.version_info.major}.{sys.version_info.minor}'
+sys.path.insert(0, f'{shared_dir}/lib/python{python_version}/site-packages')
+sys.path.insert(0, f'{shared_dir}/lib64/python{python_version}/site-packages')
+
+import argparse
+import argcomplete
+import os
+import base64
+import glob
+import subprocess
+import stat
+from shutil import which
+import tempfile
+import json
+import yaml
+from tabulate import tabulate
+
+home_dir = os.path.expanduser('~')
+container_image = f'{container_image}:{container_image_tag}'
+
+if os.path.isfile(f'{shared_dir}/clusters/clusters.yaml'):
+    with open(f'{shared_dir}/clusters/clusters.yaml') as clusters_file:
+        clusters = yaml.safe_load(clusters_file)
+else:
+    clusters = {}
+
+
+def prepare_home(cluster_name):
+    for path in [
+            f'{home_dir}/.ssh',
+            f'{home_dir}/.kube',
+            f'{home_dir}/workspace',
+            f'{home_dir}/.ocp-workspace',
+            f'{home_dir}/.ocp-workspace/{cluster_name}/kubeconfig'
+            ]:
+        os.makedirs(
+            path,
+            exist_ok = True
+        )
+    open(f'{home_dir}/.ocp-workspace/{cluster_name}/bash_history', 'a').close()
+
+
+def run_container(cluster_name, pull_policy='always', remove=False, shell='tmux'):
+    
+    uid = os.getuid()
+    gid = os.getgid()
+    if uid == 0:
+        raise Exception('Do not run as a root!')
+    
+    if not os.path.isfile(f'{shared_dir}/clusters/clusters.yaml'):
+        raise Exception(f'Cannot find file {shared_dir}/clusters/clusters.yaml. Please run ./host-preparation/set-clusters.sh script from ocp-workspace repo and try again')
+    
+    if not os.path.isfile(f'{home_dir}/.gitconfig'):
+        raise Exception(f'No global gitconfig at {home_dir}/.gitconfig. Please set user.name and user.email with "git config --global user.name \'Foo Bar\' && git config --global user.email foo.bar@example.com"')
+
+    prepare_home(cluster_name)
+
+    container = json.loads(subprocess.check_output(['podman', 'ps', '-a', '--filter', f'name=ocp-workspace-{cluster_name}', '--noheading', '--format', 'json']).decode('utf-8'))
+    container_exists = len(container) > 0
+    container_running = container_exists and container[0]['State'] == 'running'
+
+    if container_exists and not container_running:
+        print(f'Container ocp-workspace-{cluster_name} exists but is not running')
+        print(f'Removing ocp-workspace-{cluster_name} container...', end='', flush=True)
+        subprocess.run(['podman', 'rm', '-if', f'ocp-workspace-{cluster_name}'], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(' done')
+        container_exists = False
+    elif container_running and remove:
+        print(f'Removing running ocp-workspace-{cluster_name} container...', end='', flush=True)
+        subprocess.run(['podman', 'rm', '-if', f'ocp-workspace-{cluster_name}'], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(' done')
+        container_exists = False
+
+    home_entries = []
+    for path in glob.glob(f'{home_dir}/.ocp-workspace/all/home/*') + \
+                glob.glob(f'{home_dir}/.ocp-workspace/all/home/.*') + \
+                glob.glob(f'{home_dir}/.ocp-workspace/{cluster_name}/home/*') + \
+                glob.glob(f'{home_dir}/.ocp-workspace/{cluster_name}/home/.*'):
+        home_entries = list(filter(lambda home_entry: home_entry['basename'] != os.path.basename(path), home_entries))
+        home_entries = home_entries + [{'path': path, 'basename': os.path.basename(path)}]
+
+    home_mounts_entries = []
+    for home_entry in home_entries:
+        home_mounts_entries = home_mounts_entries + ['-v', f'{home_entry["path"]}:/home/user/{home_entry["basename"]}:rw']
+
+    if not container_exists:
+        cmd = ([
+            'podman',
+             'run',
+             '-d',
+             '-it',
+             '--pull', pull_policy,
+             '--security-opt', 'label=disable',
+             '--name', f'ocp-workspace-{cluster_name}',
+             '--userns', 'keep-id',
+             '--network', 'host',
+             '-v', f'/run/user/{uid}:/run/user/{uid}:rw',
+             '-v', f'{home_dir}/.ssh:/home/user/.ssh:rw',
+             '-v', f'{home_dir}/.gitconfig:/home/user/.gitconfig:rw',
+             '-v', f'{home_dir}/.ocp-workspace/{cluster_name}/kubeconfig:/home/user/.kube:rw',
+             '-v', f'{home_dir}/.ocp-workspace/{cluster_name}/bash_history:/home/user/.bash_history:rw',
+             '-v', f'{home_dir}/workspace:/home/user/workspace:rw',
+             '-v', f'{shared_dir}/clusters/clusters.yaml:/etc/clusters.yaml:ro',
+             '-v', '/tmp:/tmp:rw'    # This is required to make sure that the ssh public key propagation works correctly
+                                     # We cannot mount directly the SSH_AUTH_SOCK temp directory because it will be mounted
+                                     # only when the container is being created, but next time we login to the management host
+                                     # the SSH_AUTH_SOCK temp directory will be different and, if we don't use the --remove option
+                                     # we will not recreate the container, hence we will not mount the correct directory again.
+                                     # If we mount the whole /tmp directory it will work as expected
+            ] +
+            home_mounts_entries +
+            [container_image]
+        )
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+    
+    # We need to run the startup script after we have started the continer, because if we run the startup script
+    # as entry point, it might happen that when we run podman exec with -u user, the actions performed by the startup
+    # script have not completed yet, ending up in some unexpected behavior (like permission errors)
+    subprocess.run([
+        'podman',
+        'exec',
+        '-e', f'WORKSPACE_USER={uid}',
+        '-e', f'WORKSPACE_GROUP={gid}',
+        f'ocp-workspace-{cluster_name}',
+        '/usr/local/bin/startup.sh'
+        ], check=True)
+
+    prompt_format = f'[{cluster_name} \\W]\\$ '
+    shell_cmd = {
+            'tmux': ['/usr/bin/tmux'],
+            'bash': ['/bin/bash', '-ic', 'clear && /bin/bash || true']  # The || true is a workaround to avoid that, if we exit from container
+                                                                        # after last command returned non 0 return code, podman returns
+                                                                        # the same error code
+            }[shell]
+    ssh_auth_sock = os.getenv('SSH_AUTH_SOCK')
+
+    os.makedirs(
+        f'/tmp/tmux-{uid}',
+        exist_ok = True
+    )
+
+    cmd = ([
+            'podman',
+            'exec',
+            '-it',
+            '-u', 'user',
+            '-w', '/home/user',
+            '-e', f'TMUX=/tmp/tmux-{uid}/{cluster_name}',
+            '-e', f'PS1={prompt_format}',
+            '-e', f'XDG_RUNTIME_DIR=/run/user/{uid}',
+            '-e', f'CLUSTER_NAME={cluster_name}',
+            '-e', f'CLUSTER_API_ENDPOINT=https://api.{cluster_name}.{clusters[cluster_name]["base_domain"]}:6443',
+            '-e', f'SSH_AUTH_SOCK={ssh_auth_sock}',
+            '-e', 'LANG=C.utf8',
+            '-e', 'LC_ALL=C.utf8',
+         f'ocp-workspace-{cluster_name}'
+        ] +
+        shell_cmd
+        )
+    subprocess.run(cmd, check=True)
+ 
+def remove_container(cluster_name):
+    container = json.loads(subprocess.check_output(['podman', 'ps', '-a', '--filter', f'name=ocp-workspace-{cluster_name}', '--noheading', '--format', 'json']).decode('utf-8'))
+    container_exists = len(container) > 0
+
+    if container_exists :
+        print(f'Removing ocp-workspace-{cluster_name} container...', end='', flush=True)
+        subprocess.run(['podman', 'rm', '-if', f'ocp-workspace-{cluster_name}'], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(' done')
+    else:
+        print(f'Container ocp-workspace-{cluster_name} does not exist. Skipping')
+
+
+def list_containers():
+    containers = get_containers()
+    if len(containers) == 0:
+        return
+    headers = ['CLUSTER', 'STATUS']
+    data = [[container['cluster'], container['status']] for container in containers]
+    print(tabulate(data, headers=headers, tablefmt='plain'))
+
+
+def get_containers():
+    containers = json.loads(subprocess.check_output(['podman', 'ps', '-a', '--filter', 'name=ocp-workspace', '--noheading', '--format', 'json']).decode('utf-8'))
+    return [{'name': container['Names'][0], 'cluster': container['Names'][0].partition("ocp-workspace-")[2], 'status': container['Status']} for container in containers]
+
+
+def main(args):
+    if args.command == 'shell-completion':
+        if args.shell == 'bash':
+            show_bash_completion()
+            exit(0)
+        else:
+            raise Exception('Invalid shell name')
+    
+    if args.command == 'run':
+        run_container(args.cluster_name, args.pull_policy, args.remove, args.shell)
+    elif args.command == 'rm':
+        if args.rm_command == 'all':
+            containers = get_containers()
+            cluster_list = [container['cluster'] for container in containers]
+        else:
+            cluster_list = args.cluster_name
+        for cluster in cluster_list:
+            remove_container(cluster)
+    elif args.command == 'list':
+        list_containers()
+    else:
+        raise Exception(f'Invalid command: {args.command}')
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description='Run ocp-workspace container',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    cmd_subparser = parser.add_subparsers(
+        dest='command',
+        help='command to execute'
+    )
+    list_parser = cmd_subparser.add_parser(
+        'list',
+        help='list ocp-workspace containers'
+    )
+    run_parser = cmd_subparser.add_parser(
+        'run',
+        help='run ocp-workspace container'
+    )
+    run_parser.add_argument(
+        'cluster_name',
+        metavar='CLUSTER_NAME',
+        choices=list(clusters.keys()),
+        help='cluster name'
+    )
+    run_parser.add_argument(
+        '-p', '--pull',
+        dest='pull_policy',
+        choices=['always','newer', 'missing','never'],
+        default=os.getenv('PODMAN_PULL_POLICY') if os.getenv('PODMAN_PULL_POLICY') in ['always', 'newer', 'missing', 'never'] else 'newer',
+        help='pull image policy. Default is newer. Can also be set via PODMAN_PULL_POLICY env variable'
+    )
+    run_parser.add_argument(
+        '-s', '--shell',
+        dest='shell',
+        choices=['tmux','bash'],
+        default=os.getenv('OCP_WORKSPACE_SHELL') if os.getenv('OCP_WORKSPACE_SHELL') in ['tmux', 'bash'] else 'tmux',
+        help='shell used in the container. Default is tmux. Can also be set via OCP_WORKSPACE_SHELL env variable'
+    )
+    run_parser.add_argument(
+        '-r', '--remove',
+        dest='remove',
+        action='store_true',
+        help='delete the ocp-workspace container (if any)'
+    )
+    remove_parser = cmd_subparser.add_parser(
+        'rm',
+        help='remove ocp-workspace container'
+    )
+    cluster_remove_subparser = remove_parser.add_subparsers(
+        dest='rm_command',
+        help='name of the ocp-workspace container to remove'
+    )
+    all_remove_subparser = cluster_remove_subparser.add_parser(
+        'all',
+        help='remove all ocp-workspace containers'
+    )
+    cluster_remove_subparser = cluster_remove_subparser.add_parser(
+        'cluster',
+        help='remove ocp-workspace container for givel cluster list'
+    )
+    cluster_remove_subparser.add_argument(
+        'cluster_name',
+        metavar='CLUSTER_NAME',
+        choices=list(clusters.keys()),
+        nargs='+',
+        help='cluster name. Accept multiple entries'
+    )
+    argcomplete.autocomplete(parser)
+    args = parser.parse_args()
+    main(args)

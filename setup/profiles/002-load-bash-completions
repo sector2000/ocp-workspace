@@ -1,0 +1,15 @@
+#!/bin/bash
+
+shopt -s nullglob
+
+for file in "##SHARED_DIR##/bash_completion.scripts/"*; do
+  . "$file"
+done
+for file in "##SHARED_DIR##/bash_completion.tools/"*; do
+  . "$file"
+done
+for file in "##SHARED_DIR##/bash_completion.bin/"*; do
+  . "$file"
+done
+
+shopt -u nullglob

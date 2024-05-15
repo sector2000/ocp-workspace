@@ -1,0 +1,4 @@
+cluster1:
+  base_domain: ocp.example.com
+cluster2:
+  base_domain: ocp.example.com

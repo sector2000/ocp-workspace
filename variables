@@ -1,0 +1,15 @@
+# This file is being sourced by the setup scripts.
+# The following variables are reserved 
+#
+#  shared_dir: the full path of the directory where the ocp-workspace artifacts will be installed
+#  shared_user: the name of the shared user
+#  container_image: the container image
+#  container_image_tag: the container image tag
+#
+shared_dir=/ocp-workspace
+shared_user=ocp-user
+container_image=docker.io/sector2000/ocp-workspace
+container_image_tag=latest
+#export https_proxy=
+#export http_proxy=
+#export no_proxy=
